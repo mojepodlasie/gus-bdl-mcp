@@ -4,15 +4,21 @@ Dokumentacja API: https://api.stat.gov.pl/Home/BdlApi
 Transport: streamable HTTP, endpoint /mcp
 """
 
+import asyncio
 import os
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 BDL_BASE_URL = "https://bdl.stat.gov.pl/api/v1"
 CLIENT_ID = os.environ.get("GUS_BDL_CLIENT_ID", "").strip()
 PORT = int(os.environ.get("PORT", "8000"))
+TIMEOUT = httpx.Timeout(float(os.environ.get("GUS_BDL_TIMEOUT", "60")), connect=15.0)
+MAX_ATTEMPTS = 2
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 mcp = FastMCP(
     "gus-bdl",
@@ -37,17 +43,37 @@ async def bdl_get(path: str, params: dict[str, Any] | None = None) -> dict[str, 
     for key, value in (params or {}).items():
         if value is not None and value != "" and value != []:
             query[key] = value
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": "gus-bdl-mcp/1.1"}
     if CLIENT_ID:
         headers["X-ClientId"] = CLIENT_ID
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(f"{BDL_BASE_URL}{path}", params=query, headers=headers)
-    if response.status_code != 200:
-        return {
-            "error": f"BDL API zwróciło status {response.status_code}",
-            "details": response.text[:1000],
-        }
-    return response.json()
+
+    last_error = ""
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = await client.get(
+                    f"{BDL_BASE_URL}{path}", params=query, headers=headers
+                )
+            except httpx.TimeoutException as exc:
+                last_error = f"Przekroczono czas oczekiwania na GUS ({type(exc).__name__})"
+            except httpx.HTTPError as exc:
+                last_error = f"Błąd połączenia z GUS ({type(exc).__name__}): {exc}"
+            else:
+                if response.status_code == 200:
+                    return response.json()
+                last_error = f"BDL API zwróciło status {response.status_code}"
+                if response.status_code not in RETRY_STATUSES:
+                    return {"error": last_error, "details": response.text[:1000]}
+            if attempt < MAX_ATTEMPTS:
+                await asyncio.sleep(2 * attempt)
+
+    hint = (
+        ""
+        if CLIENT_ID
+        else " Wskazówka: ustaw zmienną GUS_BDL_CLIENT_ID (klucz z https://api.stat.gov.pl/Home/BdlApi), "
+        "aby korzystać z własnego limitu zapytań."
+    )
+    return {"error": f"{last_error} po {MAX_ATTEMPTS} próbach.{hint}", "path": path}
 
 
 @mcp.tool()
@@ -134,6 +160,14 @@ async def get_data_by_variable(
 async def get_measures() -> dict[str, Any]:
     """Zwraca listę jednostek miary używanych w BDL (np. osoba, %, zł)."""
     return await bdl_get("/measures", {"page-size": 100})
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Prosty test działania usługi (np. dla Render)."""
+    return JSONResponse(
+        {"status": "ok", "service": "gus-bdl-mcp", "mcp_endpoint": "/mcp", "client_id_set": bool(CLIENT_ID)}
+    )
 
 
 if __name__ == "__main__":
